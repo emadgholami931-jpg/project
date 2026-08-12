@@ -1,0 +1,104 @@
+name: Build Flashcard APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.3.1'
+          cache-provider: basic
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT" -type f -name sdkmanager 2>/dev/null | head -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager was not found under $SDK_ROOT"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Read app version
+        shell: bash
+        run: |
+          VERSION_NAME="$(grep '^VERSION_NAME=' version.properties | cut -d= -f2-)"
+          VERSION_CODE="$(grep '^VERSION_CODE=' version.properties | cut -d= -f2-)"
+          test -n "$VERSION_NAME"
+          test -n "$VERSION_CODE"
+          echo "APP_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "APP_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+      - name: Run unit tests
+        run: gradle test --stacktrace
+
+      - name: Build installable debug APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Prepare optional release signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/flashcard-release.jks"
+            echo "HAS_SIGNING=true" >> "$GITHUB_ENV"
+            echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/flashcard-release.jks" >> "$GITHUB_ENV"
+          else
+            echo "HAS_SIGNING=false" >> "$GITHUB_ENV"
+            echo "Signing secrets are not configured; release APK will be skipped."
+          fi
+
+      - name: Build signed release APK
+        if: ${{ env.HAS_SIGNING == 'true' }}
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ env.ANDROID_KEYSTORE_FILE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Prepare APK artifacts
+        shell: bash
+        run: |
+          mkdir -p artifact
+          cp app/build/outputs/apk/debug/app-debug.apk "artifact/flashcard-${APP_VERSION_NAME}-debug.apk"
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk "artifact/flashcard-${APP_VERSION_NAME}-release.apk"
+          fi
+          if [ -f app/build/outputs/mapping/release/mapping.txt ]; then
+            cp app/build/outputs/mapping/release/mapping.txt artifact/mapping-release.txt
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v5
+        with:
+          name: flashcard-APK
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
