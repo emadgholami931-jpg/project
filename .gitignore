@@ -1,0 +1,11 @@
+.gradle/
+.idea/
+local.properties
+**/build/
+*.iml
+.DS_Store
+.env
+
+# Never commit Android signing material
+*.jks
+*.keystore
